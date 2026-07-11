@@ -1,0 +1,7 @@
+secret_output.toml
+format_secret.py
+credentials/
+*.toml
+!.streamlit/config.toml
+__pycache__/
+*.pyc

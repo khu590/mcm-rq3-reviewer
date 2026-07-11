@@ -6,6 +6,8 @@ from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 from google.auth.exceptions import GoogleAuthError
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 st.set_page_config(
     page_title="VulnScan RQ3 Reviewer",
@@ -351,6 +353,54 @@ WORKSHEET_NAME = "ratings_v2"
 SHEET_COLUMNS = ["key", "reviewer_id", "sample_id", "correctness", "usefulness",
                  "model_prediction_correct", "comments", "timestamp"]
 CREDENTIALS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CODEBERT_CHECKPOINT = os.path.join(REPO_ROOT, "experiments", "codebert-test", "checkpoint-1000")
+
+
+@st.cache_resource(show_spinner="Loading CodeBERT checkpoint...")
+def _load_codebert():
+    """Loads the debug-scale CodeBERT checkpoint (experiments/codebert-test/checkpoint-1000).
+    This predates the paper's leakage fix and label fix (Section III-A7) -- it is the same
+    checkpoint used for the out-of-distribution evaluation in Section V-C, not the final
+    corrected model behind Table VII. Kept for live-demo purposes; results here should not
+    be read as the paper's controlled numbers.
+    """
+    if not os.path.isdir(CODEBERT_CHECKPOINT):
+        return None, None
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+    model = AutoModelForSequenceClassification.from_pretrained(
+        CODEBERT_CHECKPOINT, output_attentions=True
+    )
+    model.eval()
+    return tokenizer, model
+
+
+def run_codebert_inference(code_text):
+    """Real CodeBERT inference + attention-based evidence tokens, same extraction as
+    Section IV-A: final-layer CLS-attention row, averaged across heads, top-10 tokens."""
+    tokenizer, model = _load_codebert()
+    if tokenizer is None:
+        return None
+    inputs = tokenizer(code_text, return_tensors="pt", truncation=True, max_length=256)
+    with torch.no_grad():
+        out = model(**inputs)
+    probs = torch.softmax(out.logits, dim=-1)[0]
+    pred_idx = int(torch.argmax(probs))
+    label = "VULNERABLE" if pred_idx == 1 else "SAFE"
+    confidence = float(probs[pred_idx])
+
+    attentions = out.attentions[-1][0]  # last layer, shape (heads, seq, seq)
+    cls_attn = attentions[:, 0, :].mean(dim=0)  # average heads, CLS row
+    tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+    scored = [
+        (tok.replace("Ġ", ""), score.item())
+        for tok, score in zip(tokens, cls_attn)
+        if tok not in ("<s>", "</s>", "<pad>") and len(tok.strip("Ġ")) > 1
+    ]
+    scored.sort(key=lambda x: -x[1])
+    top_tokens = [t for t, _ in scored[:10]]
+
+    return {"label": label, "confidence": confidence, "tokens": top_tokens}
 
 
 def _load_credentials():
@@ -465,6 +515,192 @@ st.markdown("""
 
 tab1, tab2, tab3 = st.tabs(["📋 Rate Explanations", "🧪 Test Your Own Code", "📊 Results & Report"])
 
+
+# ================================================================
+# TAB 2 — TEST YOUR OWN CODE
+# ================================================================
+with tab2:
+    st.markdown("""
+    <div class="hero">
+      <div class="hero-title">Test Your Own Code — Real CodeBERT Inference</div>
+      <div class="hero-sub">
+        Paste a C/C++ function below and it is run through the actual trained CodeBERT
+        model, not a rule-based approximation. This is the same model class used
+        throughout the paper, so it will reproduce the paper's own finding: it can
+        misclassify safe code, and its attention tokens may not reflect what actually
+        drove the prediction (Section V-D).
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="info-box">
+      <strong>Checkpoint used:</strong> <code>experiments/codebert-test/checkpoint-1000</code>
+      — a debug-scale checkpoint trained on 4,000 samples, predating the paper's label fix
+      and leakage fix (Section III-A7). This is the <em>same</em> checkpoint used for the
+      out-of-distribution evaluation in Section V-C. It is <strong>not</strong> the final,
+      corrected model behind Table VII's controlled numbers — no such checkpoint is
+      currently saved locally (Section VI's checkpoint corroboration gap). Predictions
+      here demonstrate real model behaviour, not this paper's headline result.
+    </div>
+    """, unsafe_allow_html=True)
+
+    lang_choice = st.selectbox(
+        "Language",
+        ["C / C++", "Java (no trained checkpoint available)"],
+        key="user_code_lang",
+    )
+
+    code_input = st.text_area(
+        "Paste your code here",
+        height=200,
+        placeholder="void example(char *input) {\n    char buf[32];\n    strcpy(buf, input);  // unsafe\n}",
+        key="user_code"
+    )
+
+    if st.button("🔍 Run CodeBERT Inference", type="primary"):
+        if lang_choice.startswith("Java"):
+            st.warning(
+                "No Java-trained checkpoint exists in this project yet (Section V-E "
+                "reports Java/C# transformer results as pending checkpoint recovery). "
+                "Running a C/C++-trained model on Java code would not be a meaningful "
+                "test, so this is disabled rather than silently giving you a wrong answer."
+            )
+        elif code_input.strip():
+            result = run_codebert_inference(code_input)
+            if result is None:
+                st.error(
+                    f"Checkpoint not found at `{CODEBERT_CHECKPOINT}`. "
+                    "This demo requires that checkpoint to be present locally."
+                )
+            else:
+                is_vuln = result["label"] == "VULNERABLE"
+                col1, col2 = st.columns(2)
+                with col1:
+                    badge = '<span class="badge-vuln">VULNERABLE</span>' if is_vuln else '<span class="badge-safe">SAFE</span>'
+                    st.markdown(f"**Prediction:** {badge}", unsafe_allow_html=True)
+                with col2:
+                    st.markdown(f"**Confidence:** `{result['confidence']*100:.2f}%`")
+
+                tokens_html = "".join([f'<span class="tok">{t}</span>' for t in result["tokens"]])
+                st.markdown(f"""
+                <div style="margin-top:12px;">
+                  <div style="font-size:10px;color:var(--muted);margin-bottom:6px;letter-spacing:1px;">ATTENTION TOKENS (what the model focused on)</div>
+                  <div class="token-row">{tokens_html}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                st.markdown("---")
+                st.markdown("""
+                **Reading this result:** a VULNERABLE prediction on safe-looking code, or
+                attention tokens on punctuation/formatting rather than the risky API call,
+                is not a bug in this demo — it reproduces the paper's own finding
+                (Section V-C, Section V-D) that this model class relies on surface tokens
+                rather than genuine code understanding.
+                """)
+        else:
+            st.warning("Please paste some code first.")
+
+# ================================================================
+# TAB 3 — RESULTS & REPORT
+# ================================================================
+with tab3:
+    st.markdown("""
+    <div class="hero">
+      <div class="hero-title">Results & Evaluation Report</div>
+      <div class="hero-sub">
+        Summary of all reviewer ratings collected so far.
+        Download the full dataset for inter-rater agreement (Fleiss' kappa) analysis.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    all_ratings = get_all_ratings()
+
+    if not all_ratings:
+        st.info("No ratings collected yet. Reviewers need to complete their evaluations first.")
+    else:
+        reviewers = list(set(r['reviewer_id'] for r in all_ratings))
+        total = len(all_ratings)
+        avg_cor = sum(r['correctness'] for r in all_ratings) / total
+        avg_use = sum(r['usefulness'] for r in all_ratings) / total
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown(f'<div class="summary-stat"><div class="summary-num" style="color:var(--accent)">{total}</div><div class="summary-label">Total Ratings</div></div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown(f'<div class="summary-stat"><div class="summary-num" style="color:var(--accent2)">{len(reviewers)}</div><div class="summary-label">Reviewers</div></div>', unsafe_allow_html=True)
+        with c3:
+            st.markdown(f'<div class="summary-stat"><div class="summary-num" style="color:var(--safe)">{avg_cor:.1f}/5</div><div class="summary-label">Avg Correctness</div></div>', unsafe_allow_html=True)
+        with c4:
+            st.markdown(f'<div class="summary-stat"><div class="summary-num" style="color:var(--warn)">{avg_use:.1f}/5</div><div class="summary-label">Avg Usefulness</div></div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # Per reviewer
+        st.markdown("### Per Reviewer Summary")
+        for rev in reviewers:
+            rev_ratings = [r for r in all_ratings if r['reviewer_id'] == rev]
+            rc = sum(r['correctness'] for r in rev_ratings) / len(rev_ratings)
+            ru = sum(r['usefulness'] for r in rev_ratings) / len(rev_ratings)
+            st.markdown(f"**{rev}** — {len(rev_ratings)}/20 rated | Avg Correctness: {rc:.1f} | Avg Usefulness: {ru:.1f}")
+
+        # Per sample
+        st.markdown("### Per Sample Summary")
+        sample_data = []
+        for s in SAMPLES:
+            s_ratings = [r for r in all_ratings if r['sample_id'] == s['id']]
+            if s_ratings:
+                ac = sum(r['correctness'] for r in s_ratings) / len(s_ratings)
+                au = sum(r['usefulness'] for r in s_ratings) / len(s_ratings)
+                sample_data.append({
+                    "Sample": s['id'],
+                    "Expected": s['expected'],
+                    "Model": s['model_pred'],
+                    "Ratings": len(s_ratings),
+                    "Avg Correctness": round(ac, 1),
+                    "Avg Usefulness": round(au, 1)
+                })
+
+        if sample_data:
+            import pandas as pd
+            df = pd.DataFrame(sample_data)
+            st.dataframe(df, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("### Download Full Dataset")
+        st.markdown("Download all ratings as JSON for Fleiss' kappa calculation and dissertation reporting.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "📥 Download Ratings JSON",
+                data=json.dumps(all_ratings, indent=2),
+                file_name=f"rq3_ratings_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        with col2:
+            if all_ratings:
+                try:
+                    import pandas as pd
+                    df_full = pd.DataFrame(all_ratings)
+                    st.download_button(
+                        "📥 Download Ratings CSV",
+                        data=df_full.to_csv(index=False),
+                        file_name=f"rq3_ratings_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                except:
+                    pass
+
+st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("""
+<div style="text-align:center;padding:20px;color:#5a7494;font-size:11px;font-family:'Space Mono',monospace;">
+DCU MSc PRACTICUM 2026 &nbsp;·&nbsp; ACADEMIC RESEARCH ONLY &nbsp;·&nbsp; ALL DATA ANONYMOUS
+</div>
+""", unsafe_allow_html=True)
 # ================================================================
 # TAB 1 — RATE EXPLANATIONS
 # ================================================================
@@ -724,193 +960,3 @@ Rate explanation quality independently of model prediction correctness.
           <div style="font-size:13px;color:var(--muted);margin-top:4px;">Thank you for contributing to this academic research. Please go to the Results tab to see your summary.</div>
         </div>
         """, unsafe_allow_html=True)
-
-# ================================================================
-# TAB 2 — TEST YOUR OWN CODE
-# ================================================================
-with tab2:
-    st.markdown("""
-    <div class="hero">
-      <div class="hero-title">Test Your Own C/C++ Code</div>
-      <div class="hero-sub">
-        Paste any C or C++ function below to get a vulnerability assessment from the rule-based analyser
-        and see which CWE patterns are detected. This helps you understand how the models approach code analysis.
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    VULN_PATTERNS = {
-        "CWE-121: Stack Buffer Overflow": {
-            "patterns": [r'strcpy\s*\(', r'strcat\s*\(', r'gets\s*\(', r'sprintf\s*\('],
-            "severity": "HIGH", "color": "#ff4b6e",
-            "what": "Unsafe string functions with no bounds checking allow buffer overflow.",
-            "fix": "Replace strcpy→strncpy, gets→fgets, sprintf→snprintf."
-        },
-        "CWE-78: OS Command Injection": {
-            "patterns": [r'system\s*\(', r'popen\s*\('],
-            "severity": "CRITICAL", "color": "#ff2d55",
-            "what": "User input passed to shell command enables arbitrary command injection.",
-            "fix": "Use execv/execl instead. Never pass user input to system()."
-        },
-        "CWE-190: Integer Overflow": {
-            "patterns": [r'malloc\s*\(\s*\w+\s*\*'],
-            "severity": "MEDIUM", "color": "#ffaa00",
-            "what": "Integer multiplication before malloc can overflow to tiny allocation.",
-            "fix": "Cast to size_t first. Check for overflow before multiply."
-        },
-        "CWE-476: NULL Pointer Dereference": {
-            "patterns": [r'malloc\s*\('],
-            "severity": "MEDIUM", "color": "#ffaa00",
-            "what": "malloc return value not checked before use.",
-            "fix": "Always check: if (!ptr) return;"
-        },
-    }
-    SAFE_PATTERNS = [r'strncpy', r'strncat', r'snprintf', r'fgets', r'sizeof']
-
-    import re
-
-    code_input = st.text_area(
-        "Paste your C/C++ code here",
-        height=200,
-        placeholder="void example(char *input) {\n    char buf[32];\n    strcpy(buf, input);  // unsafe\n}",
-        key="user_code"
-    )
-
-    if st.button("🔍 Analyse Code", type="primary"):
-        if code_input.strip():
-            found = []
-            safe_count = sum(1 for p in SAFE_PATTERNS if re.search(p, code_input))
-
-            for name, info in VULN_PATTERNS.items():
-                for pat in info["patterns"]:
-                    if re.search(pat, code_input):
-                        found.append({**info, "name": name})
-                        break
-
-            col1, col2 = st.columns(2)
-            with col1:
-                if found:
-                    st.error(f"⚠️ VULNERABLE — {len(found)} issue(s) found")
-                else:
-                    st.success("✅ No known vulnerability patterns detected")
-
-            with col2:
-                st.info(f"Safe patterns detected: {safe_count}")
-
-            if found:
-                for v in found:
-                    with st.expander(f"🔴 {v['name']} — {v['severity']}"):
-                        st.markdown(f"**What:** {v['what']}")
-                        st.markdown(f"**Fix:** {v['fix']}")
-            elif safe_count > 0:
-                st.markdown("The code uses bounded/safe functions. No overflow patterns detected.")
-
-            st.markdown("---")
-            st.markdown("""
-            **Note:** This uses rule-based pattern matching, not the CodeBERT model.
-            The research finding is that CodeBERT trained on Juliet shows similar token-bias —
-            it flags code containing `strcpy` tokens as vulnerable even when used safely.
-            """)
-        else:
-            st.warning("Please paste some code first.")
-
-# ================================================================
-# TAB 3 — RESULTS & REPORT
-# ================================================================
-with tab3:
-    st.markdown("""
-    <div class="hero">
-      <div class="hero-title">Results & Evaluation Report</div>
-      <div class="hero-sub">
-        Summary of all reviewer ratings collected so far.
-        Download the full dataset for inter-rater agreement (Fleiss' kappa) analysis.
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    all_ratings = get_all_ratings()
-
-    if not all_ratings:
-        st.info("No ratings collected yet. Reviewers need to complete their evaluations first.")
-    else:
-        reviewers = list(set(r['reviewer_id'] for r in all_ratings))
-        total = len(all_ratings)
-        avg_cor = sum(r['correctness'] for r in all_ratings) / total
-        avg_use = sum(r['usefulness'] for r in all_ratings) / total
-
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown(f'<div class="summary-stat"><div class="summary-num" style="color:var(--accent)">{total}</div><div class="summary-label">Total Ratings</div></div>', unsafe_allow_html=True)
-        with c2:
-            st.markdown(f'<div class="summary-stat"><div class="summary-num" style="color:var(--accent2)">{len(reviewers)}</div><div class="summary-label">Reviewers</div></div>', unsafe_allow_html=True)
-        with c3:
-            st.markdown(f'<div class="summary-stat"><div class="summary-num" style="color:var(--safe)">{avg_cor:.1f}/5</div><div class="summary-label">Avg Correctness</div></div>', unsafe_allow_html=True)
-        with c4:
-            st.markdown(f'<div class="summary-stat"><div class="summary-num" style="color:var(--warn)">{avg_use:.1f}/5</div><div class="summary-label">Avg Usefulness</div></div>', unsafe_allow_html=True)
-
-        st.markdown("---")
-
-        # Per reviewer
-        st.markdown("### Per Reviewer Summary")
-        for rev in reviewers:
-            rev_ratings = [r for r in all_ratings if r['reviewer_id'] == rev]
-            rc = sum(r['correctness'] for r in rev_ratings) / len(rev_ratings)
-            ru = sum(r['usefulness'] for r in rev_ratings) / len(rev_ratings)
-            st.markdown(f"**{rev}** — {len(rev_ratings)}/20 rated | Avg Correctness: {rc:.1f} | Avg Usefulness: {ru:.1f}")
-
-        # Per sample
-        st.markdown("### Per Sample Summary")
-        sample_data = []
-        for s in SAMPLES:
-            s_ratings = [r for r in all_ratings if r['sample_id'] == s['id']]
-            if s_ratings:
-                ac = sum(r['correctness'] for r in s_ratings) / len(s_ratings)
-                au = sum(r['usefulness'] for r in s_ratings) / len(s_ratings)
-                sample_data.append({
-                    "Sample": s['id'],
-                    "Expected": s['expected'],
-                    "Model": s['model_pred'],
-                    "Ratings": len(s_ratings),
-                    "Avg Correctness": round(ac, 1),
-                    "Avg Usefulness": round(au, 1)
-                })
-
-        if sample_data:
-            import pandas as pd
-            df = pd.DataFrame(sample_data)
-            st.dataframe(df, use_container_width=True)
-
-        st.markdown("---")
-        st.markdown("### Download Full Dataset")
-        st.markdown("Download all ratings as JSON for Fleiss' kappa calculation and dissertation reporting.")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                "📥 Download Ratings JSON",
-                data=json.dumps(all_ratings, indent=2),
-                file_name=f"rq3_ratings_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-                mime="application/json",
-                use_container_width=True
-            )
-        with col2:
-            if all_ratings:
-                try:
-                    import pandas as pd
-                    df_full = pd.DataFrame(all_ratings)
-                    st.download_button(
-                        "📥 Download Ratings CSV",
-                        data=df_full.to_csv(index=False),
-                        file_name=f"rq3_ratings_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                except:
-                    pass
-
-st.markdown("</div>", unsafe_allow_html=True)
-st.markdown("""
-<div style="text-align:center;padding:20px;color:#5a7494;font-size:11px;font-family:'Space Mono',monospace;">
-DCU MSc PRACTICUM 2026 &nbsp;·&nbsp; ACADEMIC RESEARCH ONLY &nbsp;·&nbsp; ALL DATA ANONYMOUS
-</div>
-""", unsafe_allow_html=True)
