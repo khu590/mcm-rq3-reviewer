@@ -194,6 +194,34 @@ div[data-testid="stSlider"] { }
 }
 .stButton button:hover { border-color:var(--accent) !important; color:var(--accent) !important; }
 div[data-testid="stExpander"] { background:var(--surface) !important; border:1px solid var(--border) !important; border-radius:10px !important; }
+
+/* --- Visual polish (cosmetic only; rating controls stay neutral) --- */
+@keyframes gradShift { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
+@keyframes dotPulse { 0%,100%{box-shadow:0 0 0 0 rgba(0,229,255,0.35)} 50%{box-shadow:0 0 0 6px rgba(0,229,255,0)} }
+@keyframes barGlow { 0%,100%{box-shadow:0 0 6px rgba(0,229,255,0.35)} 50%{box-shadow:0 0 16px rgba(108,99,255,0.6)} }
+
+.stApp {
+  background-image:
+    linear-gradient(rgba(0,229,255,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,229,255,0.03) 1px, transparent 1px) !important;
+  background-size:38px 38px !important;
+}
+.hero-title {
+  background:linear-gradient(90deg, var(--text) 0%, var(--accent) 35%, var(--accent2) 65%, var(--text) 100%);
+  background-size:250% auto;
+  -webkit-background-clip:text; background-clip:text;
+  -webkit-text-fill-color:transparent;
+  animation:gradShift 8s ease infinite;
+}
+.sample-dot.current { animation:dotPulse 1.6s ease-in-out infinite; }
+.progress-fill { background-size:200% auto; animation:gradShift 4s linear infinite, barGlow 2.5s ease-in-out infinite; }
+.tok { transition:all 0.15s ease; cursor:default; }
+.tok:hover { transform:translateY(-2px) scale(1.08); background:rgba(108,99,255,0.3); color:#c9c4ff; border-color:#9990ff; }
+.card { transition:border-color 0.25s ease; }
+.card:hover { border-color:rgba(0,229,255,0.3); }
+.term-dots { display:flex; gap:5px; }
+.term-dots span { width:10px; height:10px; border-radius:50%; display:inline-block; }
+.term-dots .r { background:#ff5f57; } .term-dots .y { background:#febc2e; } .term-dots .g { background:#28c840; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -785,6 +813,20 @@ Rate explanation quality independently of model prediction correctness.
     rated_ids = [v['sample_id'] for v in my_ratings.values()]
     progress = len(rated_ids)
 
+    # Consume navigation state before rendering so the dot grid highlights
+    # the sample actually about to be shown
+    if 'current_sample' not in st.session_state:
+        st.session_state.current_sample = 0
+    if 'pending_nav' in st.session_state:
+        st.session_state.current_sample = st.session_state.pending_nav
+        del st.session_state.pending_nav
+
+    milestone = st.session_state.pop('just_hit', None)
+    if milestone == 20:
+        st.balloons()
+    elif milestone in (5, 10, 15):
+        st.toast(f"🔥 {milestone}/20 rated — keep going!")
+
     st.markdown(f"""
     <div class="progress-wrap">
       <div class="progress-label">
@@ -796,22 +838,14 @@ Rate explanation quality independently of model prediction correctness.
       </div>
       <div class="sample-grid">
     """ + "".join([
-        f'<div class="sample-dot {"rated" if s["id"] in rated_ids else ""}">{i+1}</div>'
+        f'<div class="sample-dot {"rated" if s["id"] in rated_ids else ""} {"current" if i == st.session_state.current_sample else ""}">{i+1}</div>'
         for i, s in enumerate(SAMPLES)
     ]) + """
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Navigation
-    if 'current_sample' not in st.session_state:
-        st.session_state.current_sample = 0
-
-    # Navigation — use a single source of truth via pending_nav
-    if 'pending_nav' in st.session_state:
-        st.session_state.current_sample = st.session_state.pending_nav
-        del st.session_state.pending_nav
-
+    # Navigation (state consumed above, before the dot grid renders)
     nav1, nav2, nav3 = st.columns([2, 3, 2])
     with nav1:
         prev_disabled = st.session_state.current_sample == 0
@@ -879,7 +913,7 @@ Rate explanation quality independently of model prediction correctness.
         """, unsafe_allow_html=True)
 
         # Code
-        st.markdown('<div class="card"><div class="card-header"><span class="card-title">Source Code</span></div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="card"><div class="card-header"><span class="card-title">Source Code — {sample["id"].lower()}.c</span><span class="term-dots"><span class="r"></span><span class="y"></span><span class="g"></span></span></div></div>', unsafe_allow_html=True)
         st.code(sample['code'], language='c')
 
         # Attention tokens
@@ -956,6 +990,8 @@ Rate explanation quality independently of model prediction correctness.
 
         if st.button(btn_label, type="primary", use_container_width=True, key=f"save_{sample['id']}"):
             if save_rating(reviewer_id, sample['id'], correctness, usefulness, pred_correct, comments):
+                if sample['id'] not in rated_ids:
+                    st.session_state.just_hit = progress + 1
                 st.success(f"Rating saved for {sample['id']}!")
                 if st.session_state.current_sample < 19:
                     st.session_state.current_sample += 1
