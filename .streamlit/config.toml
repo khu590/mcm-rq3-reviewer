@@ -1,0 +1,4 @@
+# Deployed app never edits its own source; the watcher only adds noise
+# (it walks every transformers submodule on each rerun) and startup cost.
+[server]
+fileWatcherType = "none"
