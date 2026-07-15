@@ -511,7 +511,7 @@ def save_rating(reviewer_id, sample_id, correctness, usefulness, pred_correct, c
         if cell:
             ws.update(f"A{cell.row}:H{cell.row}", [row])
         else:
-            ws.append_row(row)
+            ws.append_row(row, table_range="A1")
     except (FileNotFoundError, GoogleAuthError, gspread.exceptions.APIError) as e:
         st.error(f"Could not save rating to Google Sheets: {e}")
         return False
